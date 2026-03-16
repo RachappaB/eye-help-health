@@ -2,8 +2,8 @@
 """
 Eye Blink Reminder — Ubuntu Desktop
 -------------------------------------
-Fades screen to black every 60-80 s, holds for 1.5 s, then vanishes instantly.
-No fade-back / no flash of light.
+Screen goes INSTANTLY black → holds → instantly disappears.
+Zero brightness changes. Zero color transitions. Pure black only.
 
 Requirements:
     sudo apt install python3-tk libnotify-bin
@@ -11,7 +11,7 @@ Requirements:
 Optional tray icon:
     pip install pystray pillow
 
-Auto-start:
+Auto-start on login:
     python3 blink_reminder.py --install
     python3 blink_reminder.py --remove
 """
@@ -34,11 +34,9 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CFG = {
-    "min_interval":  60,     # seconds
-    "max_interval":  80,
-    "fade_in_ms":    700,    # ms to go from normal → full black
-    "hold_ms":       1500,   # ms to stay black (then instant hide)
-    "fade_steps":    30,     # smoothness of fade-in
+    "min_interval":  120,    # seconds between reminders
+    "max_interval":  240,
+    "hold_ms":       1500,  # how long screen stays black (ms)
     "notify":        True,
     "rule_20_20_20": False,
 }
@@ -73,80 +71,61 @@ class BlinkOverlay:
 
     def _build_window(self):
         r = self.root
-        r.overrideredirect(True)
-        r.withdraw()
+        r.overrideredirect(True)   # no title bar
+        r.withdraw()               # hidden at start
         r.update_idletasks()
 
         sw = r.winfo_screenwidth()
         sh = r.winfo_screenheight()
         r.geometry(f"{sw}x{sh}+0+0")
         r.attributes("-topmost", True)
-        r.configure(bg="black")
 
-        self._canvas = tk.Canvas(r, width=sw, height=sh,
-                                 bg="white", highlightthickness=0)
+        # ── Everything is BLACK from the start. Never changes color. ──
+        r.configure(bg="#000000")
+        self._canvas = tk.Canvas(
+            r, width=sw, height=sh,
+            bg="#000000",           # pure black — always
+            highlightthickness=0
+        )
         self._canvas.pack(fill="both", expand=True)
 
+        # Subtle white text shown only while black
         self._label = tk.Label(
-            r, text="", font=("Sans", 30, "bold"),
-            fg="#ffffff", bg="#000000",
+            r, text="",
+            font=("Sans", 26, "bold"),
+            fg="#cccccc",
+            bg="#000000",
         )
         self._canvas.create_window(sw // 2, sh // 2,
                                    window=self._label, anchor="center")
 
         r.bind("<Escape>", lambda _: self.quit())
-        self._sw, self._sh = sw, sh
 
-    # ── Fade-in: white → black ────────────────────────────────────────────────
-    def _fade_in(self, step, steps, delay_ms, msg, hold_ms):
-        if step == 0:
-            self._label.config(text=msg)
-            # Reset canvas to white before starting
-            self._canvas.config(bg="#ffffff")
-            self._label.config(bg="#ffffff", fg="#ffffff")
-            self.root.deiconify()
-            self.root.lift()
-            self.root.attributes("-topmost", True)
-            self.root.focus_force()
+    # ── Show: instantly black ─────────────────────────────────────────────────
+    def _show_black(self, msg, hold_ms):
+        self._label.config(text=msg)
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.focus_force()
+        self.root.update()
+        # After holding, instantly vanish
+        self.root.after(hold_ms, self._instant_hide)
 
-        # brightness: 255 (white) → 0 (black)
-        brightness = int(255 * (1 - (step + 1) / steps))
-        brightness = max(0, brightness)
-        col = f"#{brightness:02x}{brightness:02x}{brightness:02x}"
-        self._canvas.config(bg=col)
-        # Label blends into background until fully dark, then text appears
-        if brightness < 80:
-            self._label.config(bg="#000000", fg="#ffffff")
-        else:
-            self._label.config(bg=col, fg=col)   # invisible during fade
-
-        if step < steps - 1:
-            self.root.after(delay_ms, self._fade_in,
-                            step + 1, steps, delay_ms, msg, hold_ms)
-        else:
-            # Fully black — hold, then instantly hide (no fade-out / no flash)
-            self._canvas.config(bg="#000000")
-            self._label.config(bg="#000000", fg="#ffffff")
-            self.root.after(hold_ms, self._instant_hide)
-
+    # ── Hide: instantly gone ──────────────────────────────────────────────────
     def _instant_hide(self):
-        """Just withdraw immediately — no fade-back, no flash."""
         self.root.withdraw()
         self._animating = False
 
-    # ── Trigger ───────────────────────────────────────────────────────────────
+    # ── Trigger (called from timer thread via after) ──────────────────────────
     def trigger_blink(self, rule_20=False):
         if self._animating:
             return
         self._animating = True
-
         msg     = ("Look 20 ft away for 20 seconds..."
                    if rule_20 else "Blink slowly — relax your eyes")
         hold_ms = 20_000 if rule_20 else CFG["hold_ms"]
-        steps   = CFG["fade_steps"]
-        step_ms = max(1, CFG["fade_in_ms"] // steps)
-
-        self.root.after(0, self._fade_in, 0, steps, step_ms, msg, hold_ms)
+        self.root.after(0, self._show_black, msg, hold_ms)
 
     # ── Timer thread ──────────────────────────────────────────────────────────
     def _timer_loop(self):
@@ -171,10 +150,8 @@ class BlinkOverlay:
 
             self.trigger_blink(rule_20=rule_20)
 
-            # Wait for animation + hold to finish
-            total = (CFG["fade_in_ms"] +
-                     (20_000 if rule_20 else CFG["hold_ms"])) / 1000 + 1
-            time.sleep(total)
+            hold_s = (20 if rule_20 else CFG["hold_ms"] / 1000) + 1
+            time.sleep(hold_s)
 
     def start(self):
         threading.Thread(target=self._timer_loop, daemon=True).start()
@@ -210,18 +187,21 @@ def build_tray(overlay):
         return None
 
     def on_pause(icon, item):
-        overlay.pause(); icon.title = "Blink Reminder [Paused]"
+        overlay.pause()
+        icon.title = "Blink Reminder [Paused]"
         notify("Blink Reminder", "Paused")
 
     def on_resume(icon, item):
-        overlay.resume(); icon.title = "Blink Reminder [Running]"
+        overlay.resume()
+        icon.title = "Blink Reminder [Running]"
         notify("Blink Reminder", "Resumed")
 
     def on_blink_now(icon, item):
         overlay.trigger_blink()
 
     def on_quit(icon, item):
-        icon.stop(); overlay.quit()
+        icon.stop()
+        overlay.quit()
 
     def set_interval(lo, hi):
         def _fn(icon, item):
@@ -270,10 +250,12 @@ Comment=Reminds you to blink and rest your eyes
 """)
     print(f"Auto-start installed: {f}")
 
+
 def remove_autostart():
     f = os.path.expanduser("~/.config/autostart/blink_reminder.desktop")
     if os.path.exists(f):
-        os.remove(f); print("Auto-start removed.")
+        os.remove(f)
+        print("Auto-start removed.")
     else:
         print("No auto-start entry found.")
 
@@ -303,6 +285,7 @@ def main():
     notify("Eye Blink Reminder", f"Started. First blink in {lo}-{hi} s.")
     print(f"Running — first blink in {lo}-{hi} s. ESC or Ctrl-C to quit.")
     overlay.run()
+
 
 if __name__ == "__main__":
     main()
